@@ -23,6 +23,39 @@ truncated.log.normal <- function(mean, std.dev, min, max) {
 }
 
 ##
+## Internet one way delay model
+## Lognormal: meanlog=2.8447, sdlog=0.0088
+## mean: exp(meanlog+sdlog^2/2) = 17.19706 ms
+## coefficient of variation: sqrt(exp(sdlog^2)-1) = 0.0088 ms
+## @inproceedings{hernandez2007one,
+##   title =	 {One-way delay measurement and characterization},
+##   author =	 {Hernandez, Ana and Magana, Eduardo},
+##   booktitle =	 {Networking and Services, 2007. ICNS. Third
+##                   International Conference on},
+##   pages =	 {114--114},
+##   year =	 2007,
+##   organization = {IEEE}
+## }
+meanlog <- 2.8447
+sdlog <- 0.0088
+get.owd <- function(n=1) {
+    if(meanlog > 0) {
+        rlnorm(n=n, meanlog=meanlog, sdlog=sdlog)*1e-3 # seconds
+    } else {
+        0.0
+    }
+}
+set.owd.parameters <- function(mean, coef.var=0.0088) {
+    v <- (mean*coef.var)^2
+    if(mean > 0) {
+        meanlog <<- log(mean/sqrt(1+v/mean^2))
+        sdlog <<- sqrt(log(1+v/mean^2))
+    } else {
+        meanlog <<- 0
+    }
+}
+
+##
 ## HTTP requests generator
 ## Model described in cdma2000 Evaluation Methodology, HTTP Model, page 59.
 ## http://www.3gpp2.org/public_html/specs/C.R1002-0_v1.0_041221.pdf
@@ -49,6 +82,34 @@ httpr.mean <- function() {
     mean.embedded.objects <- (1.1*2)/(1.1-1)*(1-(2/55)^(1.1-1))/(1-(2/55)^(1.1))-2
     10710 + 8140 * mean.embedded.objects
 }
+
+##
+## send.message class
+##
+send.message <-
+    R6Class("send.message",
+            inherit = Event,
+            portable = TRUE,
+            cloneable = FALSE,
+            private = list(
+                destination=NULL,
+                parameters=NULL
+           ),
+            public = list(
+                initialize = function(delay, destination, parameters) {
+                    if(delay>0) {
+                        private$destination <- destination
+                        private$parameters <- parameters
+                        super$sched.event(time=delay)
+                    } else {
+                        destination(parameters)
+                    }
+                },
+                handle.event = function() {
+                    private$destination(private$parameters)
+                }
+            ))
+                
 
 ##
 ## Arrival class
@@ -103,17 +164,25 @@ ZoneRR <-
             portable = TRUE,
             cloneable = FALSE,
             private = list(
-                sla.r=NA,    ## 1/Bw SLA
+                sla.r=NA,    ## Bw SLA [Bps]
                 Rweight=NA,
-                Pweight=NA,
                 cdn=NULL,
                 bgd=NULL,
+                choose.proxy.type=NULL, # cost, roundrobin
+                roundrobin.last.proxy=NULL,
+                number.of.proxies=NULL,
                 ##
                 ## cost function
                 ##
                 cost = function() {
-                    # self$Qreq + private$Rweight * self$Rqueue + private$Pweight * self$Penalty
                     (self$Qreq+1)*self$Penalty + private$Rweight * self$Rqueue 
+                },
+                cost2 = function() {
+                    self$Qreq + private$Rweight * self$Rqueue 
+                },
+                roundrobin = function() {
+                    private$roundrobin.last.proxy <-
+                        (private$roundrobin.last.proxy %% private$number.of.proxies) + 1
                 }
             ),
             public = list(
@@ -124,24 +193,27 @@ ZoneRR <-
                 fileConn = NULL,
                 initialize = function(N,
                     proxy.access.bw, # Proxy Bw vector [Bps]
-                    sla.bw, # Connection Bw SLA [Bps]
+                    sla.bw, # Connection Bw SLA [Mbps]
                     cdn.load, # cdn load
                     bgd.load, # background load
-                    Rweight,  # alpha in equation (3)
-                    Pweight,  # Penalty weight
+                    Rweight,  # gamma in equation (3)
                     zrr.update.time, # ZRR update time
+                    choose.proxy.type='cost', # proxy selection type: cost, roundrobin
+                    max.queue.len=max.queue.len, # max requets allowed by a proxy
                     fname=NULL  # trace file name
                                       ){
                     ##
                     stopifnot(N>0)
                     stopifnot(length(proxy.access.bw)==N)
                     simu.init.event.sim()
-                    private$sla.r <- 1/sla.bw
+                    private$sla.r <- 8e-6/sla.bw # Convert sla.bw from Mbps to Bps
                     private$Rweight <- Rweight
-                    private$Pweight <- Pweight
                     self$Rqueue <- vector(mode = "numeric", len=N)
                     self$Qreq <-   vector(mode = "integer", len=N)
                     self$Penalty <- vector(mode = "numeric", len=N)
+                    private$choose.proxy.type <- choose.proxy.type
+                    private$roundrobin.last.proxy <- 0
+                    private$number.of.proxies <- N
                     if(!is.null(fname)) {
                         fname <- paste0(fname, '.gz')
                         message("Trace file: ", fname)
@@ -151,7 +223,8 @@ ZoneRR <-
                     }
                     for(n in 1:N) {
                         self$proxies[[n]] <-
-                            Proxy$new(id=n, zrr=self, access.bw=proxy.access.bw[n], zrr.update.time=zrr.update.time) ;
+                            Proxy$new(id=n, zrr=self, access.bw=proxy.access.bw[n],
+                                      zrr.update.time=zrr.update.time, max.queue.len=max.queue.len) ;
                     }
                     ## schedule 1st HTTP request cdn.request.
                     cdn.aps <- cdn.load*sum(proxy.access.bw)/httpr.mean()
@@ -161,31 +234,46 @@ ZoneRR <-
                     private$cdn <- arrival$new(arrivals.per.second=cdn.aps,
                                                first.arrival.time=0,
                                                notify.arrival=self$cdn.request)
-                    private$bgd <- arrival$new(arrivals.per.second=bgd.aps,
-                                               first.arrival.time=N*zrr.update.time,
-                                               notify.arrival=self$bgd.request)
+                    if(bgd.load > 0) {
+                        private$bgd <- arrival$new(arrivals.per.second=bgd.aps,
+                                                   first.arrival.time=N*zrr.update.time,
+                                                   notify.arrival=self$bgd.request)
+                    }
                 },
                 ##
                 close.trace = function() {
-                    close(self$fileConn)
+                    if(!is.null(self$fileConn)) {
+                        close(self$fileConn)
+                    }
                 },
                 ##
                 ## Proxy update
                 ##
-                update = function(id, r, e, v) {
-                    self$Rqueue[id] <- max(self$Rqueue[id]+r-private$sla.r, 0)
-                    self$Penalty[id] <- r
-                    self$Qreq[id] <- self$Qreq[id] - e
+                update = function(par) {
+                    if(debug.events) {
+                        message(sprintf("%.2f proxy.arr%d e=%d r=%.2g v=%.2f",
+                                        simu.currtime, par$id, par$e, par$r, par$v))
+                    }
+                    self$Rqueue[par$id] <- max(self$Rqueue[par$id]+par$r-private$sla.r, 0)
+                    self$Penalty[par$id] <- par$r
+                    self$Qreq[par$id] <- self$Qreq[par$id] - par$e
                 },
                 ##
                 ## cdn.request handler
                 ##
                 cdn.request = function(http.request.size) {
-                    choose.proxy <- which.min(private$cost())
+                    choose.proxy <-
+                        switch(private$choose.proxy.type,
+                               cost = which.min(private$cost()),
+                               cost2 = which.min(private$cost2()),
+                               roundrobin = private$roundrobin(),
+                               stop("choose.proxy.type?"))
                     if(debug.events) {
-                        message(sprintf("%.2f cdn.arr %d", simu.currtime, choose.proxy))
+                        message(sprintf("%.2f cdn.send %d", simu.currtime, choose.proxy))
                     }
-                    self$proxies[[choose.proxy]]$cdn.arrival(http.request.size)
+                    send.message$new(delay=get.owd(),
+                                 destination=self$proxies[[choose.proxy]]$cdn.arrival,
+                                 parameters=http.request.size)
                     self$Qreq[choose.proxy] <- self$Qreq[choose.proxy] + 1
                 },
                 ##
@@ -194,9 +282,11 @@ ZoneRR <-
                 bgd.request = function(http.request.size) {
                     choose.proxy <- sample(1:length(self$proxies), size=1)
                     if(debug.events) {
-                        message(sprintf("%.2f bgd.arr %d", simu.currtime, choose.proxy))
+                        message(sprintf("%.2f bgd.send %d", simu.currtime, choose.proxy))
                     }
-                    self$proxies[[choose.proxy]]$bgd.arrival(http.request.size)
+                    send.message$new(delay=get.owd(),
+                                 destination=self$proxies[[choose.proxy]]$bgd.arrival,
+                                 parameters=http.request.size)
                 },
                 print = function() {
                     message(sprintf("Aggregated proxy capacity [MBps]: %.2f",
@@ -205,7 +295,9 @@ ZoneRR <-
                     message("CDN traffic")
                     private$cdn$print()
                     message("BACKGROUND traffic")
-                    private$bgd$print()
+                    if(!is.null(private$bgd)) {
+                        private$bgd$print()
+                    }
                     self$proxies[[1]]$print.header()
                     for(p in self$proxies) { p$print() }
                 }
@@ -277,6 +369,7 @@ queue <-
                     } else {
                         if(self$len == self$max.len) {
                             self$lost <- self$lost + 1
+                            return(FALSE)
                         } else {
                             if(size >= self$req[1]) { # 1st position
                                 self$bytes[2:(self$len+1)] <- self$bytes[1:self$len]
@@ -307,6 +400,7 @@ queue <-
                             self$len <- self$len + 1
                         }
                     }
+                    return(TRUE)
                 },
                 del = function() {
                     self$len <- self$len-1
@@ -332,9 +426,10 @@ Proxy <-
                 zrr=NULL,     # field pointing to ZoneRR
                 zrr.update.time=1,# ZRR update time
                 access.bw=NA, # available Bw, MBps (Bytes per second)
-                dispached=NA, # Number of CDN dispached req. during the current slot.
-                mean.bw=NA,   # mean Bw of CDN dispached requests.
-                cdn.traffic.volume=NA, # Bytes of CDN traffic dispached during the current slot.
+                dispatched=NA, # Number of CDN dispatched req. during the current slot.
+                dispatched.lost=NA, # Number of CDN lost req. during the current slot.
+                sum.successful.dispatched.bw=NA,   # mean Bw of CDN dispatched requests.
+                cdn.traffic.volume=NA, # Bytes of CDN traffic dispatched during the current slot.
                 updates=NA,   # number of updates
                 queue.last.update.time=NA, # last time the queues where updated
                 ##
@@ -359,8 +454,8 @@ Proxy <-
                     throughput <- private$queue.cdn$bytes[private$queue.cdn$len]/
                         (private$queue.last.update.time-private$queue.cdn$time[private$queue.cdn$len])
                     private$cdn.throughput.sum <- private$cdn.throughput.sum + throughput
-                    private$dispached <- private$dispached+1
-                    private$mean.bw <- private$mean.bw+throughput
+                    private$dispatched <- private$dispatched+1
+                    private$sum.successful.dispatched.bw <- private$sum.successful.dispatched.bw+throughput
                     private$queue.cdn$del()
                     if(!is.null(private$zrr$fileConn)) {
                         cat(private$id, "cdn", throughput, private$queue.cdn$len+private$queue.bgd$len,
@@ -449,8 +544,9 @@ Proxy <-
                     private$zrr <- zrr
                     private$zrr.update.time <- zrr.update.time
                     private$access.bw <- access.bw
-                    private$dispached <- 0
-                    private$mean.bw <- access.bw
+                    private$dispatched <- 0
+                    private$dispatched.lost <- 0
+                    private$sum.successful.dispatched.bw <- access.bw
                     private$cdn.traffic.volume <- 0
                     private$updates <- 0
                     private$queue.last.update.time <- 0
@@ -468,14 +564,22 @@ Proxy <-
                 ## handle cdn arrivals
                 ##
                 cdn.arrival = function(size) {
+                    if(debug.events) {
+                        message(sprintf("%.2f cdn.arr %d", simu.currtime, private$id))
+                    }
                     private$cdn.traffic.volume <- private$cdn.traffic.volume + size
                     while(private$update.queue.req()){}
-                    private$queue.cdn$add(size)
+                    if(!private$queue.cdn$add(size)) { # the request is lost
+                        private$dispatched.lost <- private$dispatched.lost+1
+                    }
                 },
                 ##
                 ## handle background arrivals
                 ##
                 bgd.arrival = function(size) {
+                    if(debug.events) {
+                        message(sprintf("%.2f bgd.arr %d", simu.currtime, private$id))
+                    }
                     while(private$update.queue.req()){}
                     private$queue.bgd$add(size)
                 },
@@ -486,26 +590,29 @@ Proxy <-
                     private$updates <- private$updates + 1
                     while(private$update.queue.req()){}
                     r <-
-                        if(private$dispached > 0) {
-                            max(private$dispached/private$mean.bw,
+                        if(private$dispatched > 0) {
+                            max(private$dispatched/private$sum.successful.dispatched.bw,
                                 max(private$queue.cdn$len+private$queue.bgd$len,1)/private$access.bw)
                         } else {
                             max(private$queue.cdn$len+private$queue.bgd$len,1)/private$access.bw
                         }
                     if(debug.events) {
-                        message(sprintf("%.2f proxy%d e=%d r=%.2g v=%.2f",
+                        message(sprintf("%.2f proxy.send%d e=%d r=%.2g v=%.2f",
                                         simu.currtime, private$id,
-                                        private$dispached,
+                                        private$dispatched+private$dispatched.lost,
                                         r,
                                         v=private$cdn.traffic.volume))
                     }
-                    private$zrr$update(private$id,
-                                       r=r,
-                                       e=private$dispached,
-                                       v=private$cdn.traffic.volume)
+                    send.message$new(delay=get.owd(),
+                                     destination=private$zrr$update,
+                                     parameters=list(id=private$id,
+                                         r=r,
+                                         e=private$dispatched+private$dispatched.lost,
+                                         v=private$cdn.traffic.volume))
                     private$cdn.traffic.volume <- 0
-                    private$dispached <- 0
-                    private$mean.bw <- 0
+                    private$dispatched <- 0
+                    private$dispatched.lost <- 0
+                    private$sum.successful.dispatched.bw <- 0
                     super$sched.event(time=private$zrr.update.time)
                 },
                 print.header = function() {

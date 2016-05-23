@@ -3,7 +3,7 @@
 ##########################################################################################
 library(R6)
 
-simu.currtime <- 0.0   # current simulated time
+simu.currtime <- 0.0   # current simulated time (seconds)
 simu.events <- NULL    # event list
 
 Event <- 
