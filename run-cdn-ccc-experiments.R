@@ -48,6 +48,7 @@ zrr <- run.simulation(
     # owd.mean=20,
     owd.coef.var=0.1,
     choose.proxy.type='roundrobin',
+    max.queue.len=300,
     seed=0 # simulation seed
 )
 
